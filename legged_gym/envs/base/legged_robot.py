@@ -107,6 +107,7 @@ class LeggedRobot(BaseTask):
         """
         clip_actions = self.cfg.normalization.clip_actions
         self.actions = torch.clip(actions, -clip_actions, clip_actions).to(self.device)
+        self._update_action_targets()
         # step physics and render each frame
         self.render()
         for _ in range(self.cfg.control.decimation):
@@ -219,6 +220,7 @@ class LeggedRobot(BaseTask):
 
         # reset buffers
         self.last_actions[env_ids] = 0.
+        self.action_targets[env_ids] = self.default_dof_pos.expand(len(env_ids), -1)
         self.last_dof_vel[env_ids] = 0.
         self.feet_air_time[env_ids] = 0.
         self.episode_length_buf[env_ids] = 0
@@ -476,7 +478,7 @@ class LeggedRobot(BaseTask):
             d_gains = self.d_gains
 
         if control_type=="P":
-            torques = p_gains*(actions_scaled + self.default_dof_pos - self.dof_pos) - d_gains*self.dof_vel
+            torques = p_gains*(self.action_targets - self.dof_pos) - d_gains*self.dof_vel
         elif control_type=="V":
             torques = p_gains*(actions_scaled - self.dof_vel) - d_gains*(self.dof_vel - self.last_dof_vel)/self.sim_params.dt
         elif control_type=="T":
@@ -697,9 +699,23 @@ class LeggedRobot(BaseTask):
                 if self.cfg.control.control_type in ["P", "V"]:
                     print(f"PD gain of joint {name} were not defined, setting them to zero")
         self.default_dof_pos = self.default_dof_pos.unsqueeze(0)
+        cutoff_hz = getattr(self.cfg.control, "action_lpf_cutoff_hz", 5.0)
+        if cutoff_hz is None or cutoff_hz <= 0.:
+            self.action_lpf_alpha = 1.
+        else:
+            self.action_lpf_alpha = float(1. - np.exp(-2. * np.pi * cutoff_hz * self.dt))
+        self.action_targets = self.default_dof_pos.repeat(self.num_envs, 1)
 
         if self.cfg.domain_rand.randomize_gains:
             self.randomized_p_gains, self.randomized_d_gains = self.compute_randomized_gains(self.num_envs)
+
+    def _update_action_targets(self):
+        """Update the held position targets once per policy step."""
+        if self.cfg.control.control_type != "P":
+            return
+        with torch.no_grad():
+            raw_targets = self.actions * self.cfg.control.action_scale + self.default_dof_pos
+            self.action_targets.add_(self.action_lpf_alpha * (raw_targets - self.action_targets))
 
     def compute_randomized_gains(self, num_envs):
         p_mult = ((

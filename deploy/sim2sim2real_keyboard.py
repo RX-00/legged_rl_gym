@@ -27,6 +27,7 @@ import select
 import os
 import yaml
 from scipy.spatial.transform import Rotation as R
+from action_lpf import ActionTargetLowPassFilter, action_to_joint_target
 
 # ========== Config loader ==========
 
@@ -68,6 +69,8 @@ def load_config(config_path):
     }
 
     c.action_scale       = float(cfg['action_scale'])
+    action_lpf_cutoff_hz = cfg.get('action_lpf_cutoff_hz', 5.0)
+    c.action_lpf_cutoff_hz = None if action_lpf_cutoff_hz is None else float(action_lpf_cutoff_hz)
     c.clip_observations  = float(cfg.get('clip_observations', 100.0))
     c.clip_actions       = float(cfg.get('clip_actions', 100.0))
 
@@ -327,6 +330,12 @@ class Sim2SimController:
         # 策略频率控制
         self.policy_decimation = int(config.policy_dt / config.sim_dt)
         self.policy_counter = 0
+        self.action_filter = ActionTargetLowPassFilter(
+            config.default_dof_pos,
+            config.action_lpf_cutoff_hz,
+            self.policy_decimation * config.sim_dt,
+        )
+        self.qDes = self.action_filter.reset()
         
         # 初始化机器人位置
         for i, qpos_addr in enumerate(self.joint_qpos_addrs):
@@ -467,10 +476,11 @@ class Sim2SimController:
                             action = action_tensor.cpu().numpy().flatten().astype(np.float32)
                         
                         # Scale action to joint targets
-                        action = np.clip(action, -self.config.clip_actions, self.config.clip_actions)
-                        self.last_action = action[:12].copy()
-                        self.qDes = action[:12] * self.config.action_scale + self.config.default_dof_pos
-                        self.qDes = np.clip(self.qDes, self.config.joint_limit_low, self.config.joint_limit_high)
+                        self.last_action, self.qDes = action_to_joint_target(
+                            action,
+                            self.config,
+                            self.action_filter,
+                        )
         
                     self.send_command(self.qDes, self.config.kp_walk, self.config.kd_walk)
                 
@@ -554,6 +564,12 @@ class Sim2RealController:
         # 策略频率控制
         self.policy_decimation = int(config.policy_dt / config.sim_dt)
         self.policy_counter = 0
+        self.action_filter = ActionTargetLowPassFilter(
+            config.default_dof_pos,
+            config.action_lpf_cutoff_hz,
+            self.policy_decimation * config.sim_dt,
+        )
+        self.qDes_train = self.action_filter.reset()
         
         print("Sim2Real controller initialized")
     
@@ -771,11 +787,11 @@ class Sim2RealController:
                     action = action_tensor.cpu().numpy().flatten().astype(np.float32)
                 
                 # Scale action
-                action = np.clip(action, -self.config.clip_actions, self.config.clip_actions)
-                self.last_action = action[:12].copy()
-                
-                self.qDes_train = action[:12] * self.config.action_scale + self.config.default_dof_pos
-                self.qDes_train = np.clip(self.qDes_train, self.config.joint_limit_low, self.config.joint_limit_high)
+                self.last_action, self.qDes_train = action_to_joint_target(
+                    action,
+                    self.config,
+                    self.action_filter,
+                )
                 
                 # 打印策略输出（每秒一次）
                 if int(sim_time * 1000) % 1000 < self.config.sim_dt * 1000:

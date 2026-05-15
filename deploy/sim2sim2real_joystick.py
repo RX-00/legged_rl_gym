@@ -27,6 +27,7 @@ import mujoco.viewer
 from scipy.spatial.transform import Rotation as R
 import yaml
 from legged_gym import LEGGED_GYM_ROOT_DIR
+from action_lpf import ActionTargetLowPassFilter, action_to_joint_target
 
 # ========== Configuration loader ==========
 def load_config(config_path):
@@ -57,6 +58,8 @@ def load_config(config_path):
                 elif isinstance(value, list):
                     if key in ('sdk_joint_order', 'leg_order', 'joint_suffixes'):
                         setattr(self, key, value)
+                    elif key in ('train_to_sdk_map', 'sdk_to_train_map'):
+                        setattr(self, key, np.array(value, dtype=np.int64))
                     else:
                         try:
                             setattr(self, key, np.array(value, dtype=np.float32))
@@ -67,6 +70,7 @@ def load_config(config_path):
             
             # 自动计算 policy_dt 等 (保留原有逻辑)
             if hasattr(self, 'policy_hz'): self.policy_dt = 1.0 / self.policy_hz
+            if not hasattr(self, 'action_lpf_cutoff_hz'): self.action_lpf_cutoff_hz = 5.0
             if hasattr(self, 'vx_range'): self.vx_range = tuple(self.vx_range)
             if hasattr(self, 'vy_range'): self.vy_range = tuple(self.vy_range)
             if hasattr(self, 'vyaw_range'): self.vyaw_range = tuple(self.vyaw_range)
@@ -323,6 +327,12 @@ class Sim2SimController:
         # Policy frequency control
         self.policy_decimation = int(config.policy_dt / config.sim_dt)
         self.policy_counter = 0
+        self.action_filter = ActionTargetLowPassFilter(
+            config.default_dof_pos,
+            config.action_lpf_cutoff_hz,
+            self.policy_decimation * config.sim_dt,
+        )
+        self.qDes = self.action_filter.reset()
         
         # Initialize robot pose
         for i, qpos_addr in enumerate(self.joint_qpos_addrs):
@@ -439,8 +449,11 @@ class Sim2SimController:
                             action = action_tensor.cpu().numpy().flatten().astype(np.float32)
                         
                         # Scale action to joint targets
-                        self.last_action = action[:12].copy()
-                        self.qDes = action[:12] * self.config.action_scale + self.config.default_dof_pos
+                        self.last_action, self.qDes = action_to_joint_target(
+                            action,
+                            self.config,
+                            self.action_filter,
+                        )
         
                     self.send_command(self.qDes)
                 
@@ -489,8 +502,13 @@ class Sim2RealController:
         self.sdk = sdk
         
         # SDK Index
-        self.index = config.index
-        self.order = config.joint_order
+        self.joint_order = getattr(config, 'sdk_joint_order', [
+            'FR_0', 'FR_1', 'FR_2',
+            'FL_0', 'FL_1', 'FL_2',
+            'RR_0', 'RR_1', 'RR_2',
+            'RL_0', 'RL_1', 'RL_2',
+        ])
+        self.index = {name: i for i, name in enumerate(self.joint_order)}
         
         # Initial UDP
         LOWLEVEL = 0xff
@@ -514,6 +532,12 @@ class Sim2RealController:
         # Policy frequency control
         self.policy_decimation = int(config.policy_dt / config.sim_dt)
         self.policy_counter = 0
+        self.action_filter = ActionTargetLowPassFilter(
+            config.default_dof_pos,
+            config.action_lpf_cutoff_hz,
+            self.policy_decimation * config.sim_dt,
+        )
+        self.qDes_train = self.action_filter.reset()
 
         # Cache the latest SDK command for constant 200Hz sending
         self.current_qDes_sdk = None
@@ -555,6 +579,18 @@ class Sim2RealController:
         print("Robot connected successfully!")
         self._print_state()
         return True
+
+    def _print_state(self):
+        """Print the latest received robot state."""
+        print("\nCurrent joint angles (SDK order: FR, FL, RR, RL):")
+        for leg in ['FR', 'FL', 'RR', 'RL']:
+            hip = self.low_state.motorState[self.index[f'{leg}_0']].q
+            thigh = self.low_state.motorState[self.index[f'{leg}_1']].q
+            calf = self.low_state.motorState[self.index[f'{leg}_2']].q
+            print(f"  {leg}: hip={hip:+.3f}, thigh={thigh:+.3f}, calf={calf:+.3f}")
+
+        rpy = self.low_state.imu.rpy
+        print(f"IMU: roll={rpy[0]:+.3f}, pitch={rpy[1]:+.3f}, yaw={rpy[2]:+.3f}")
     
     def get_state(self):
         """Get the current state (format conversion only, no UDP receive).
@@ -604,15 +640,28 @@ class Sim2RealController:
         """Run the real-robot control loop."""
         if not self.wait_for_connection():
             print("Failed to connect to robot!")
+            return
+
+        motiontime = 0
         
         while True:
             loop_start = time.time()  # record loop start time
+            motiontime += 1
+            sim_time = motiontime * self.config.sim_dt
             
             # ⚠️ First receive low_state
             self.udp.Recv()
             self.udp.GetRecv(self.low_state)
-        
-            # Run control step
+
+            if gamepad.exit_requested:
+                damping_cmd = np.zeros(12, dtype=np.float32)
+                self.send_command(damping_cmd, 0.0, 3.0)
+                self.udp.SetSend(self.low_cmd)
+                self.udp.Send()
+                break
+
+            base_ang_vel, projected_gravity, dof_pos, dof_vel = self.get_state()
+            rpy = np.array(self.low_state.imu.rpy, dtype=np.float32)
             
             # Phase 1: stand up
             if sim_time <= self.config.standup_duration:
@@ -665,9 +714,11 @@ class Sim2RealController:
                         action = action_tensor.cpu().numpy().flatten().astype(np.float32)
                     
                     # Scale action
-                    self.last_action = action[:12].copy()
-                    
-                    self.qDes_train = action[:12] * self.config.action_scale + self.config.default_dof_pos
+                    self.last_action, self.qDes_train = action_to_joint_target(
+                        action,
+                        self.config,
+                        self.action_filter,
+                    )
                     
                     # Update cached command (this will be sent repeatedly for the next frames)
                     self.current_qDes_sdk = self.qDes_train[self.config.train_to_sdk_map]
@@ -677,17 +728,16 @@ class Sim2RealController:
         
             # Key fix: send commands every 200Hz loop regardless of inference
             if self.current_qDes_sdk is not None:
-                
                 self.send_command(self.current_qDes_sdk, self.current_kp, self.current_kd)
-                # send commands (keeps UDP communication alive at 200Hz)
-                self.udp.SetSend(self.low_cmd)
-                self.udp.Send()
-                time.sleep(self.config.control_dt)
             else:
                 # Initialization phase: send damping command to avoid sudden motor motion
                 damping_cmd = np.zeros(12, dtype=np.float32)
                 self.send_command(damping_cmd, 0.0, 3.0)
-                 
+
+            # send commands (keeps UDP communication alive at 200Hz)
+            self.udp.SetSend(self.low_cmd)
+            self.udp.Send()
+
             # Precise timing: compensate for execution time
             elapsed = time.time() - loop_start
             sleep_time = max(0, self.config.sim_dt - elapsed)

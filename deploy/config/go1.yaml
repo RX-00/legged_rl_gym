@@ -30,6 +30,7 @@ obs_scales:
 
 # ========== Action scale ==========
 action_scale: 0.25
+action_lpf_cutoff_hz: 5.0
 
 # ========== Stand / stabilize durations ==========
 standup_duration: 2.0      # standup duration (s)

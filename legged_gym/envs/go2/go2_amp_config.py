@@ -71,6 +71,7 @@ class GO2AMPCfg( LeggedRobotCfg ):
         damping = {'joint': 0.5}     # [N*m*s/rad]
         # action scale: target angle = actionScale * action + defaultAngle
         action_scale = 0.25
+        action_lpf_cutoff_hz = 5.0
         # decimation: Number of control action updates @ sim DT per policy DT
         decimation = 6
 
@@ -112,7 +113,7 @@ class GO2AMPCfg( LeggedRobotCfg ):
 
     class rewards( LeggedRobotCfg.rewards ):
         soft_dof_pos_limit = 0.9
-        base_height_target = 0.25
+        base_height_target = 0.25 # The retargeting script says to change it to 0.34, but our envs uses 0.27, so 0.25 sounds fine
         class scales( LeggedRobotCfg.rewards.scales ):
             termination = 0.0
             tracking_lin_vel = 1.5 * 1. / (.005 * 6)
@@ -172,5 +173,3 @@ class GO2AMPCfgPPO( LeggedRobotCfgPPO ):
         amp_discr_hidden_dims = [1024, 512]
 
         min_normalized_std = [0.05, 0.02, 0.05] * 4
-
-  
