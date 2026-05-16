@@ -525,7 +525,7 @@ class Sim2RealController:
         
         # 导入 SDK
         SDK_PATH = os.path.join(os.path.dirname(__file__),
-                                '../../unitree_legged_sdk/lib/python/amd64')
+                                '../unitree_legged_sdk/lib/python/amd64')
         sys.path.append(SDK_PATH)
         import robot_interface as sdk
         self.sdk = sdk

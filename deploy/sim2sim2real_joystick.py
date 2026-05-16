@@ -1,269 +1,296 @@
-#!/usr/bin/python
-# -*- coding: utf-8 -*-
-"""
-Unified Sim2Sim (MuJoCo) and Sim2Real (Unitree SDK) controller
+#!/usr/bin/env python3
 
-Supports two modes:
-1. Sim2Sim: MuJoCo simulation (--mode sim)
-2. Sim2Real: Unitree Go1 real robot (--mode real)
-
-Shared configuration parameters and policy inference logic.
-
-Usage:
-    Simulation: python sim2sim_sim2real_unified.py --mode sim
-    Real robot: python sim2sim_sim2real_unified.py --mode real
-"""
-
-import time
-import numpy as np
 import argparse
-import torch
-import threading
-import sys
 import os
-from joystick import RemoteController, apply_deadzone
-import mujoco
-import mujoco.viewer
-from scipy.spatial.transform import Rotation as R
+import sys
+import time
+import threading
+
+import numpy as np
+import torch
 import yaml
-from legged_gym import LEGGED_GYM_ROOT_DIR
+
+from joystick import RemoteController, apply_deadzone
 from action_lpf import ActionTargetLowPassFilter, action_to_joint_target
 
-# ========== Configuration loader ==========
+from unitree_sdk2py.core.channel import (
+    ChannelFactoryInitialize,
+    ChannelPublisher,
+    ChannelSubscriber,
+)
+from unitree_sdk2py.idl.default import unitree_go_msg_dds__LowCmd_
+from unitree_sdk2py.idl.unitree_go.msg.dds_ import LowCmd_, LowState_
+from unitree_sdk2py.utils.crc import CRC
+from unitree_sdk2py.comm.motion_switcher.motion_switcher_client import MotionSwitcherClient
+from unitree_sdk2py.go2.sport.sport_client import SportClient
+
+
+POS_STOP_F = 2.146e9
+VEL_STOP_F = 16000.0
+
+
+# =============================================================================
+# Config / observation helpers
+# =============================================================================
+
 def load_config(config_path):
-    """Load configuration from a YAML file."""
-    with open(config_path, 'r') as f:
-        config_dict = yaml.safe_load(f)
-    
-    # 获取当前脚本所在目录，用于处理 YAML 内部的相对路径
+    config_path = os.path.abspath(config_path)
     script_dir = os.path.dirname(os.path.abspath(__file__))
 
+    with open(config_path, "r") as f:
+        cfg = yaml.safe_load(f)
+
     class Config:
-        def __init__(self, cfg):
-            for key, value in cfg.items():
-                # --- 新增：路径处理逻辑 ---
-                if isinstance(value, str) and ('/' in value or '\\' in value):
-                    # 替换环境变量占位符
-                    if "{LEGGED_GYM_ROOT_DIR}" in value:
-                        # 假设你已经定义了该环境变量，或者手动指定
-                        value = value.replace("{LEGGED_GYM_ROOT_DIR}", LEGGED_GYM_ROOT_DIR)
-                    
-                    # 如果是相对路径，将其转为基于脚本位置的绝对路径
+        def __init__(self, d):
+            for key, value in d.items():
+                if isinstance(value, str):
+                    value = value.replace(
+                        "{LEGGED_GYM_ROOT_DIR}",
+                        os.environ.get("LEGGED_GYM_ROOT_DIR", ""),
+                    )
                     if value.startswith("./") or value.startswith("../"):
                         value = os.path.abspath(os.path.join(script_dir, value))
-                
-                # 标准转换逻辑
+
                 if isinstance(value, dict):
                     setattr(self, key, value)
                 elif isinstance(value, list):
-                    if key in ('sdk_joint_order', 'leg_order', 'joint_suffixes'):
+                    if key in ("sdk_joint_order", "leg_order", "joint_suffixes"):
                         setattr(self, key, value)
-                    elif key in ('train_to_sdk_map', 'sdk_to_train_map'):
+                    elif key in ("train_to_sdk_map", "sdk_to_train_map"):
                         setattr(self, key, np.array(value, dtype=np.int64))
                     else:
                         try:
                             setattr(self, key, np.array(value, dtype=np.float32))
-                        except:
+                        except Exception:
                             setattr(self, key, value)
                 else:
                     setattr(self, key, value)
-            
-            # 自动计算 policy_dt 等 (保留原有逻辑)
-            if hasattr(self, 'policy_hz'): self.policy_dt = 1.0 / self.policy_hz
-            if not hasattr(self, 'action_lpf_cutoff_hz'): self.action_lpf_cutoff_hz = 5.0
-            if hasattr(self, 'vx_range'): self.vx_range = tuple(self.vx_range)
-            if hasattr(self, 'vy_range'): self.vy_range = tuple(self.vy_range)
-            if hasattr(self, 'vyaw_range'): self.vyaw_range = tuple(self.vyaw_range)
 
-    return Config(config_dict)
+            if hasattr(self, "policy_hz"):
+                self.policy_dt = 1.0 / float(self.policy_hz)
 
-# ========== Helper functions ==========
+            if not hasattr(self, "action_lpf_cutoff_hz"):
+                self.action_lpf_cutoff_hz = 5.0
+
+            if hasattr(self, "vx_range"):
+                self.vx_range = tuple(float(x) for x in self.vx_range)
+            if hasattr(self, "vy_range"):
+                self.vy_range = tuple(float(x) for x in self.vy_range)
+            if hasattr(self, "vyaw_range"):
+                self.vyaw_range = tuple(float(x) for x in self.vyaw_range)
+
+    return Config(cfg)
+
+
+def quat_from_euler_xyz(roll, pitch, yaw):
+    cr = np.cos(roll * 0.5)
+    sr = np.sin(roll * 0.5)
+    cp = np.cos(pitch * 0.5)
+    sp = np.sin(pitch * 0.5)
+    cy = np.cos(yaw * 0.5)
+    sy = np.sin(yaw * 0.5)
+
+    x = sr * cp * cy - cr * sp * sy
+    y = cr * sp * cy + sr * cp * sy
+    z = cr * cp * sy - sr * sp * cy
+    w = cr * cp * cy + sr * sp * sy
+    return np.array([x, y, z, w], dtype=np.float32)
+
 
 def quat_rotate_inverse(q, v):
-    """Rotate a vector from world frame to body frame using the inverse quaternion."""
     q_w = q[3]
     q_vec = q[:3]
-    a = v * (2.0 * q_w ** 2 - 1.0)
+    a = v * (2.0 * q_w * q_w - 1.0)
     b = np.cross(q_vec, v) * q_w * 2.0
     c = q_vec * np.dot(q_vec, v) * 2.0
     return a - b + c
 
 
-def compute_projected_gravity(quat):
-    """Compute the projected gravity vector in the body frame."""
+def compute_projected_gravity(quat_xyzw):
     gravity_world = np.array([0.0, 0.0, -1.0], dtype=np.float32)
-    projected_gravity = quat_rotate_inverse(quat, gravity_world)
-    return projected_gravity
+    return quat_rotate_inverse(quat_xyzw, gravity_world).astype(np.float32)
 
-def build_obs(base_ang_vel, projected_gravity, commands, dof_pos, dof_vel, last_action, config):
-    """
-    Build the observation vector (45 dims):
-    1-3:   base angular velocity [wx, wy, wz] scaled by ang_vel
-    4-6:   projected gravity [gx, gy, gz]
-    7-9:   commands [lin_vel_x, lin_vel_y, ang_vel_yaw] scaled by commands
-    10-21: joint position delta (dof_pos - default_dof_pos) scaled by dof_pos
-    22-33: joint velocities scaled by dof_vel
-    34-45: last actions
-    """
+
+def build_obs(
+    base_ang_vel,
+    projected_gravity,
+    commands,
+    dof_pos,
+    dof_vel,
+    last_action,
+    config,
+):
     obs = []
-    
-    # 1-3: Base angular velocity (scaled)
-    obs.extend(list(base_ang_vel * config.obs_scales['ang_vel']))
-    
-    # 4-6: Projected gravity
+
+    obs.extend(list(base_ang_vel * config.obs_scales["ang_vel"]))
     obs.extend(list(projected_gravity))
-    
-    # 7-9: Commands (scaled)
-    commands_scaled = commands * config.obs_scales['commands']
+
+    commands_scaled = commands * config.obs_scales["commands"]
     obs.extend(list(commands_scaled))
-    
-    # 10-21: dof_pos - default_dof_pos (scaled)
-    pos_delta = (dof_pos - config.default_dof_pos) * config.obs_scales['dof_pos']
+
+    pos_delta = (dof_pos - config.default_dof_pos) * config.obs_scales["dof_pos"]
     obs.extend(list(pos_delta))
-    
-    # 22-33: dof_vel (scaled)
-    obs.extend(list(dof_vel * config.obs_scales['dof_vel']))
-    
-    # 34-45: Last action
+
+    obs.extend(list(dof_vel * config.obs_scales["dof_vel"]))
     obs.extend(list(last_action))
-    
+
     return np.array(obs, dtype=np.float32)
 
 
-# ========== Gamepad controller ==========
+def normalize_obs(obs, clip_observations=None):
+    if clip_observations is None:
+        return obs
+    try:
+        clip = float(clip_observations)
+    except Exception:
+        return obs
+    return np.clip(obs, -clip, clip).astype(np.float32)
+
+
+def resolve_policy_path(config, model_arg):
+    if model_arg:
+        # If config.policy_path is a file, put model next to it.
+        if os.path.splitext(config.policy_path)[1]:
+            return os.path.join(os.path.dirname(config.policy_path), model_arg)
+        return os.path.join(config.policy_path, model_arg)
+
+    return config.policy_path
+
+
+# =============================================================================
+# Gamepad controller
+# =============================================================================
 
 class GamepadController:
-    """Thread-safe gamepad controller (Logitech F710 - Linux native interface)."""
-    def __init__(self, vx_range=(0.0, 1.2), vy_range=(-0.3, 0.3), vyaw_range=(-1.57, 1.57)):
+    """
+    Logitech F710-style gamepad interface using deploy/joystick.py.
+
+    Left stick:
+      up/down    -> vx
+      left/right -> vy
+
+    Right stick:
+      left/right -> yaw
+
+    D-pad:
+      up/down    -> incremental vx setpoint
+
+    Start:
+      exit
+    """
+
+    def __init__(
+        self,
+        vx_range=(0.0, 1.2),
+        vy_range=(-0.3, 0.3),
+        vyaw_range=(-1.57, 1.57),
+    ):
         self.vx = 0.0
         self.vy = 0.0
         self.vyaw = 0.0
+
         self.vx_range = vx_range
         self.vy_range = vy_range
         self.vyaw_range = vyaw_range
+
         self.lock = threading.Lock()
         self.running = True
         self.exit_requested = False
         self.thread = None
-        
-        # Initialize gamepad (Linux native device)
+
         try:
             self.gamepad = RemoteController()
             self.gamepad.start()
-            print("✅ Gamepad initialized successfully (Linux native)")
-        except Exception as e:
-            print(f"❌ Failed to initialize gamepad: {e}")
+            print("Gamepad initialized successfully")
+        except Exception as exc:
+            print(f"Failed to initialize gamepad: {exc}")
             self.gamepad = None
-        
-        # Deadzone (normalized)
-        self.deadzone = 0.05  # 5% deadzone
-        
-        # Velocity smoothing parameters (exponential moving average)
-        self.alpha = 0.6  # smoothing: 60% new + 40% old (faster response)
-        self.vx_smooth = 0.0
-        self.vy_smooth = 0.0
-        self.vyaw_smooth = 0.0
-        
-        # Speed step control (D-pad incremental adjustment)
-        self.vx_increment = 0.1  # change per press: 0.1 m/s
-        self.vx_target = 0.0     # target speed step
-        self.dpad_last_state = {'up': False, 'down': False}  # edge detection
-    
+
+        self.deadzone = 0.05
+
+        self.vx_increment = 0.1
+        self.dpad_last_state = {"up": False, "down": False}
+
     def get_velocity(self):
         with self.lock:
             return self.vx, self.vy, self.vyaw
-    
+
     def set_velocity(self, vx, vy, vyaw):
         with self.lock:
-            self.vx = np.clip(vx, self.vx_range[0], self.vx_range[1])
-            self.vy = np.clip(vy, self.vy_range[0], self.vy_range[1])
-            self.vyaw = np.clip(vyaw, self.vyaw_range[0], self.vyaw_range[1])
-    
+            self.vx = float(np.clip(vx, self.vx_range[0], self.vx_range[1]))
+            self.vy = float(np.clip(vy, self.vy_range[0], self.vy_range[1]))
+            self.vyaw = float(np.clip(vyaw, self.vyaw_range[0], self.vyaw_range[1]))
+
     def gamepad_thread(self):
-        """Gamepad reading thread - synchronized with policy frequency."""
         if self.gamepad is None:
-            print("Gamepad not available, using zero velocity")
+            print("Gamepad unavailable; commands remain zero.")
             return
-        
-        # Sync with policy frequency: 33Hz
-        update_interval = 1.0 / 33.0  # 0.0303s
-        
+
+        update_interval = 1.0 / 33.0
+
         while self.running:
             try:
                 loop_start = time.time()
-                
-                # Read stick values (normalized to [-1, 1])
+
                 left_x, left_y = self.gamepad.get_left_stick(normalize=True)
-                right_x, right_y = self.gamepad.get_right_stick(normalize=True)
-                
-                # Apply deadzone
+                right_x, _ = self.gamepad.get_right_stick(normalize=True)
+
                 left_x = apply_deadzone(left_x, self.deadzone)
                 left_y = apply_deadzone(left_y, self.deadzone)
                 right_x = apply_deadzone(right_x, self.deadzone)
-                
-                # D-pad incremental control (HAT axes: 6=X, 7=Y)
+
                 with self.gamepad.lock:
-                    dpad_y = self.gamepad.axes[7] if len(self.gamepad.axes) > 7 else 0  # Y axis: -32767=up, +32767=down
-                
-                dpad_up_pressed = (dpad_y < -16000)    # up
-                dpad_down_pressed = (dpad_y > 16000)   # down
-                
-                # Edge detection: trigger on press (not hold)
-                if dpad_up_pressed and not self.dpad_last_state['up']:
-                    self.vx = min(self.vx + self.vx_increment, self.vx_range[1])
-                    print(f"\n[D-pad UP] speed step: {self.vx:.1f} m/s")
-                
-                if dpad_down_pressed and not self.dpad_last_state['down']:
-                    self.vx = max(self.vx - self.vx_increment, 0.0)  # min 0, no backward
-                    print(f"\n[D-pad DOWN] speed step: {self.vx:.1f} m/s")
-                
-                # Update D-pad state
-                self.dpad_last_state['up'] = dpad_up_pressed
-                self.dpad_last_state['down'] = dpad_down_pressed
-                
-                # Map sticks / D-pad to velocities
-                # Priority: D-pad speed step; sticks act as fine control
-                # Left stick Y: -1 (push up) to +1 (push down)
-                if abs(left_y) > 0.1:  # use stick if significant input
-                    if left_y <= 0:  # push up (negative Y)
-                        self.vx = (-left_y) * self.vx_range[1]  # map to [0, max]
-                    else:  # push down
-                        self.vx = 0.0  # backward not supported
-                else:  # stick centered, keep D-pad speed
-                    self.vx = self.vx
+                    dpad_y = self.gamepad.axes[7] if len(self.gamepad.axes) > 7 else 0
 
-                # Left stick X: lateral velocity mapping
-                self.vy = -left_x * (self.vy_range[1])   # -0.3 .. +0.3 m/s
+                dpad_up_pressed = dpad_y < -16000
+                dpad_down_pressed = dpad_y > 16000
 
-                # Right stick X: yaw rate mapping
-                self.vyaw = -right_x * self.vyaw_range[1]
-                
-                
-                # Update (clamped) velocity values
-                self.set_velocity(self.vx, self.vy, self.vyaw)
-                
-                # Check exit button (Start = button 7)
+                vx, vy, vyaw = self.get_velocity()
+
+                if dpad_up_pressed and not self.dpad_last_state["up"]:
+                    vx = min(vx + self.vx_increment, self.vx_range[1])
+                    print(f"\n[D-pad UP] vx step: {vx:.2f} m/s")
+
+                if dpad_down_pressed and not self.dpad_last_state["down"]:
+                    vx = max(vx - self.vx_increment, 0.0)
+                    print(f"\n[D-pad DOWN] vx step: {vx:.2f} m/s")
+
+                self.dpad_last_state["up"] = dpad_up_pressed
+                self.dpad_last_state["down"] = dpad_down_pressed
+
+                # Left stick Y: push up is usually negative.
+                if abs(left_y) > 0.1:
+                    if left_y <= 0.0:
+                        vx = (-left_y) * self.vx_range[1]
+                    else:
+                        vx = 0.0
+
+                # Left stick X maps to lateral velocity.
+                vy = -left_x * self.vy_range[1]
+
+                # Right stick X maps to yaw velocity.
+                vyaw = -right_x * self.vyaw_range[1]
+
+                self.set_velocity(vx, vy, vyaw)
+
                 if self.gamepad.is_button_pressed(self.gamepad.BTN_START):
-                    print("\n✅ Start button pressed - exiting")
+                    print("\nStart button pressed; exiting.")
                     self.exit_requested = True
                     break
-                
-                # (Periodic Gamepad print removed; status printed from simulation loop)
-                
-                # Sync with policy frequency: 33Hz (update every 0.03s)
+
                 elapsed = time.time() - loop_start
-                sleep_time = max(0, update_interval - elapsed)
+                sleep_time = max(0.0, update_interval - elapsed)
                 if sleep_time > 0:
                     time.sleep(sleep_time)
-                
-            except Exception as e:
-                print(f"\nGamepad error: {e}")
+
+            except Exception as exc:
+                print(f"\nGamepad error: {exc}")
                 time.sleep(0.1)
-    
+
     def start(self):
         self.thread = threading.Thread(target=self.gamepad_thread, daemon=True)
         self.thread.start()
-    
+
     def stop(self):
         self.running = False
         if self.gamepad:
@@ -272,266 +299,55 @@ class GamepadController:
             self.thread.join(timeout=1.0)
 
 
-# ========== Sim2Sim (MuJoCo) controller ==========
+# =============================================================================
+# SDK2 Go2 real controller
+# =============================================================================
 
-class Sim2SimController:
-    """MuJoCo simulation controller."""
-    
-    def __init__(self, config, model_name):
+class Go2SDK2JoystickController:
+    def __init__(self, config, policy_path, network):
         self.config = config
-        
-        xml_path = config.xml_path
-        policy_path = os.path.join(config.policy_path, model_name)
-        
-        # Generate joint and actuator names from configuration
-        self.joint_names = []
-        self.actuator_names = []
-        for leg in config.leg_order:
-            for suffix in config.joint_suffixes:
-                self.joint_names.append(f"{leg}_{suffix}_joint")
-                self.actuator_names.append(f"{leg}_{suffix}")
-        
-        # Load MuJoCo
-        self.mujoco = mujoco
-        self.mujoco_viewer = mujoco.viewer
-        
-        print(f"Loading MuJoCo model: {xml_path}")
-        self.model = mujoco.MjModel.from_xml_path(xml_path)
-        self.data = mujoco.MjData(self.model)
-        self.model.opt.timestep = config.sim_dt
-        
-        # Get joint qpos/dof addresses and actuator ids
-        self.joint_qpos_addrs = []
-        self.joint_dof_addrs = []
-        self.actuator_ids = []
-        
-        for joint_name, actuator_name in zip(self.joint_names, self.actuator_names):
-            joint_id = self.model.joint(joint_name).id
-            qpos_addr = self.model.jnt_qposadr[joint_id]
-            dof_addr = self.model.jnt_dofadr[joint_id]
-            actuator_id = self.model.actuator(actuator_name).id
-            
-            self.joint_qpos_addrs.append(qpos_addr)
-            self.joint_dof_addrs.append(dof_addr)
-            self.actuator_ids.append(actuator_id)
-        
-        # Load policy
-        print(f"Loading policy: {policy_path}")
-        self.policy = torch.jit.load(policy_path, map_location='cpu')
-        self.policy.eval()
-        
-        # Initialize state
-        self.last_action = np.zeros(12, dtype=np.float32)
-        self.qDes = np.zeros(12, dtype=np.float32)
-        
-        # Policy frequency control
-        self.policy_decimation = int(config.policy_dt / config.sim_dt)
-        self.policy_counter = 0
-        self.action_filter = ActionTargetLowPassFilter(
-            config.default_dof_pos,
-            config.action_lpf_cutoff_hz,
-            self.policy_decimation * config.sim_dt,
+        self.network = network
+
+        self.joint_order = getattr(
+            config,
+            "sdk_joint_order",
+            [
+                "FR_0", "FR_1", "FR_2",
+                "FL_0", "FL_1", "FL_2",
+                "RR_0", "RR_1", "RR_2",
+                "RL_0", "RL_1", "RL_2",
+            ],
         )
-        self.qDes = self.action_filter.reset()
-        
-        # Initialize robot pose
-        for i, qpos_addr in enumerate(self.joint_qpos_addrs):
-            self.data.qpos[qpos_addr] = config.default_dof_pos[i]
-        self.data.qpos[2] = 0.35  # initial height
-        mujoco.mj_forward(self.model, self.data)
-        
-        print(f"Sim2Sim controller initialized")
-        
-    
-    def get_state(self):
-        """Get current robot state needed for observation."""
-        # Base angular velocity
-        base_ang_vel = self.data.qvel[3:6].copy()
-        
-        # Projected gravity
-        quat_wxyz = self.data.qpos[3:7].copy()
-        quat_xyzw = np.array([quat_wxyz[1], quat_wxyz[2], quat_wxyz[3], quat_wxyz[0]], dtype=np.float32)
-        projected_gravity = compute_projected_gravity(quat_xyzw)
-        
-        # Joint positions and velocities
-        dof_pos = np.array([self.data.qpos[addr] for addr in self.joint_qpos_addrs], dtype=np.float32)
-        dof_vel = np.array([self.data.qvel[addr] for addr in self.joint_dof_addrs], dtype=np.float32)
-        
-        return base_ang_vel, projected_gravity, dof_pos, dof_vel
-    
-    def send_command(self, target_pos):
-        """Send control commands to MuJoCo actuators."""
-        for i, actuator_id in enumerate(self.actuator_ids):
-            self.data.ctrl[actuator_id] = target_pos[i]
-    
-    def step(self):
-        """Advance the MuJoCo simulation by one timestep."""
-        self.mujoco.mj_step(self.model, self.data)
-    
-    def run(self, gamepad):
-        """
-        Main simulation loop with Absolute Time Sync and Render Decimation.
-        """
-        motiontime = 0 # simulation step counter 
-        
-        # --- Time Synchronization Setup ---
-        sim_dt = self.model.opt.timestep  # Physics timestep (e.g., 0.005s)
-        target_render_fps = 50            # Human eye only needs 30-60 FPS
-        # Calculate how many physics steps to skip between renders
-        render_skip = int(1.0 / (target_render_fps * sim_dt))
-        if render_skip < 1: render_skip = 1
-        
-        # Launch viewer
-        with self.mujoco_viewer.launch_passive(self.model, self.data) as viewer:
-            # Initial Camera setup
-            viewer.cam.lookat[:] = self.data.qpos[:3]
-            viewer.cam.distance = 2.0
-            viewer.cam.azimuth = 90
-            viewer.cam.elevation = -20
-            
-            # --- Establish Absolute Time Reference ---
-            # Record start time immediately before entering the loop
-            start_time = time.time() 
-            
-            while viewer.is_running():
-                if gamepad.exit_requested:
-                    print("\nExit request detected, ending starget_posimulation...")
-                    break
-                
-                # Get MuJoCo internal simulation time
-                sim_time = self.data.time
-                
-                # --- Phase 1: Stand up (Linear Interpolation) ---
-                if sim_time <= self.config.standup_duration:
-                    rate = min(sim_time / self.config.standup_duration, 1.0)
-                    for i, qpos_addr in enumerate(self.joint_qpos_addrs):
-                        current_q = self.data.qpos[qpos_addr]
-                        self.qDes[i] = current_q * (1 - rate) + self.config.default_dof_pos[i] * rate
-                    self.send_command(self.qDes)
-                
-                # --- Phase 2: Stabilize at Default Pose ---
-                elif sim_time <= self.config.standup_duration + self.config.stabilize_duration:
-                    self.qDes = self.config.default_dof_pos.copy()
-                    self.send_command(self.qDes)
-                
-                # --- Phase 3: Neural Network Policy Control ---
-                else:
-                    # Safety check: Detect if robot is falling
-                    quat_wxyz = self.data.qpos[3:7].copy()
-                    quat_xyzw = np.array([quat_wxyz[1], quat_wxyz[2], quat_wxyz[3], quat_wxyz[0]])
-                    rpy = R.from_quat(quat_xyzw).as_euler('xyz')
-                    if abs(rpy[0]) > 0.8 or abs(rpy[1]) > 0.8:
-                        print(f"\nWarning at {sim_time:.2f}s: Robot tilted! roll={rpy[0]:.2f}, pitch={rpy[1]:.2f}")
-                    
-                    # Policy inference (decimated frequency)
-                    self.policy_counter += 1
-                    if self.policy_counter >= self.policy_decimation:
-                        self.policy_counter = 0
-                        
-                        # Get user input from gamepad
-                        cmd_vx, cmd_vy, cmd_vyaw = gamepad.get_velocity()
-                        commands = np.array([cmd_vx, cmd_vy, cmd_vyaw], dtype=np.float32)
-                        
-                        # Extract robot state
-                        base_ang_vel, projected_gravity, dof_pos, dof_vel = self.get_state()
-                        
-                        # Prepare observation for the policy
-                        obs = build_obs(base_ang_vel, projected_gravity, commands, 
-                                        dof_pos, dof_vel, self.last_action, self.config)
-                        obs_batch = obs[np.newaxis, :].astype(np.float32)
-                        
-                        # Forward pass through the neural network
-                        with torch.no_grad():
-                            obs_tensor = torch.from_numpy(obs_batch)
-                            action_tensor = self.policy(obs_tensor)
-                            if isinstance(action_tensor, tuple):
-                                action_tensor = action_tensor[0]
-                            action = action_tensor.cpu().numpy().flatten().astype(np.float32)
-                        
-                        # Scale action to joint targets
-                        self.last_action, self.qDes = action_to_joint_target(
-                            action,
-                            self.config,
-                            self.action_filter,
-                        )
-        
-                    self.send_command(self.qDes)
-                
-                # --- Physics Step ---
-                self.step()
-                motiontime += 1 # 注意 这个要放在整个while循环的最后面，不能只放在policy控制的部分，因为standup和stabilize阶段也需要计数
-                
-                # --- Visual Update (Render Decimation) ---
-                # Syncing every step is slow; sync at 50Hz for better performance
-                if motiontime % render_skip == 0:
-                    viewer.cam.lookat[:] = self.data.qpos[:3]
-                    viewer.sync()
-                
-                # --- Soft Real-time Synchronization (Absolute) ---
-                # Calculate the exact time we SHOULD be at
-                expected_real_time = start_time + (motiontime * sim_dt)
-                time_to_sleep = expected_real_time - time.time()
-                
-                if time_to_sleep > 0:
-                    time.sleep(time_to_sleep)
-                
-                # --- Status Telemetry (Original Format) ---
-                if motiontime % int(1.0 / self.config.sim_dt) == 0:
-                    real_time_now = time.time() - start_time
-                    actual_hz = motiontime / real_time_now if real_time_now > 0 else 0
-                    
-                    vx_cur, vy_cur, vyaw_cur = gamepad.get_velocity()
-                    
-                    print(f"[Gamepad] vx={vx_cur:+.2f} m/s | vy={vy_cur:+.2f} | yaw={vyaw_cur:+.2f} rad/s")
-                    print(f"[Sim Time]: t={self.data.time:.1f}s, Base height: {self.data.qpos[2]:.3f}m")
-                    print(f"[Real Time]: t={real_time_now:.1f}s, Actual Hz: {actual_hz:.2f} Hz")
-
-
-# ========== Sim2Real (Unitree SDK) controller ==========
-
-class Sim2RealController:
-    """Unitree Go1 real robot controller."""
-    
-    def __init__(self, config, policy_path):
-        self.config = config
-        
-        # Import Unitree SDK
-        SDK_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'unitree_legged_sdk', 'lib', 'python', 'amd64'))
-        sys.path.append(SDK_DIR)
-        import robot_interface as sdk
-        self.sdk = sdk
-        
-        # SDK Index
-        self.joint_order = getattr(config, 'sdk_joint_order', [
-            'FR_0', 'FR_1', 'FR_2',
-            'FL_0', 'FL_1', 'FL_2',
-            'RR_0', 'RR_1', 'RR_2',
-            'RL_0', 'RL_1', 'RL_2',
-        ])
         self.index = {name: i for i, name in enumerate(self.joint_order)}
-        
-        # Initial UDP
-        LOWLEVEL = 0xff
-        self.udp = sdk.UDP(LOWLEVEL, config.local_port, 
-                          config.robot_ip, config.robot_port)
-        self.low_cmd = sdk.LowCmd()
-        self.low_state = sdk.LowState()
-        self.udp.InitCmdData(self.low_cmd)
-        
-        print(f"UDP initialized: {config.robot_ip}:{config.robot_port}")
-        
-        # Load policy
-        self.policy = torch.jit.load(policy_path, map_location='cpu')
-        self.policy.eval()
+
+        print(f"Initializing SDK2/DDS on network interface: {network}")
+        ChannelFactoryInitialize(0, network)
+
+        self.low_cmd = unitree_go_msg_dds__LowCmd_()
+        self.low_state = None
+        self.low_state_lock = threading.Lock()
+        self.crc = CRC()
+
+        self._init_low_cmd()
+
+        self.lowcmd_pub = ChannelPublisher("rt/lowcmd", LowCmd_)
+        self.lowcmd_pub.Init()
+
+        self.lowstate_sub = ChannelSubscriber("rt/lowstate", LowState_)
+        self.lowstate_sub.Init(self._lowstate_callback, 10)
+
+        self.release_motion_mode()
+
         print(f"Loading policy: {policy_path}")
-        
-        # Initialize state
+        self.policy = torch.jit.load(policy_path, map_location="cpu")
+        self.policy.eval()
+
         self.last_action = np.zeros(12, dtype=np.float32)
-        self.qDes_train = np.zeros(12, dtype=np.float32)
-        
-        # Policy frequency control
+        self.qDes_train = np.array(config.default_dof_pos, dtype=np.float32)
+
         self.policy_decimation = int(config.policy_dt / config.sim_dt)
         self.policy_counter = 0
+
         self.action_filter = ActionTargetLowPassFilter(
             config.default_dof_pos,
             config.action_lpf_cutoff_hz,
@@ -539,266 +355,379 @@ class Sim2RealController:
         )
         self.qDes_train = self.action_filter.reset()
 
-        # Cache the latest SDK command for constant 200Hz sending
         self.current_qDes_sdk = None
         self.current_kp = config.kp_walk
         self.current_kd = config.kd_walk
-        
-        print("Sim2Real controller initialized")
-    
-    def wait_for_connection(self):
-        """Wait for robot connection and ensure data flow."""
-        print("Waiting for robot connection...")
 
-        # Initialize command (damping mode, Kp=0)
-        for i in range(12):
-            self.low_cmd.motorCmd[i].q = 0.0
-            self.low_cmd.motorCmd[i].dq = 0.0
-            self.low_cmd.motorCmd[i].Kp = 0.0
-            self.low_cmd.motorCmd[i].Kd = 3.0
-            self.low_cmd.motorCmd[i].tau = 0.0
+        print("Go2 SDK2 joystick controller initialized")
 
-        # Send commands to activate communications
-        for i in range(100):
-            self.udp.Recv()
-            self.udp.GetRecv(self.low_state)
-            self.udp.SetSend(self.low_cmd)
-            self.udp.Send()
-            time.sleep(self.config.sim_dt)
+    def _init_low_cmd(self):
+        self.low_cmd.head[0] = 0xFE
+        self.low_cmd.head[1] = 0xEF
+        self.low_cmd.level_flag = 0xFF
+        self.low_cmd.gpio = 0
 
-        # Check if valid joint data has been received
-        q_sum = sum(abs(self.low_state.motorState[i].q) for i in range(12))
-        if q_sum < 0.01:
-            print("Error: No valid joint data received!")
-            print("Please check:")
-            print("  1. Robot is powered on")
-            print("  2. Network connection is working")
-            print("  3. IP address is correct (current: {})".format(self.config.robot_ip))
-            return False
+        for i in range(20):
+            self.low_cmd.motor_cmd[i].mode = 0x01
+            self.low_cmd.motor_cmd[i].q = POS_STOP_F
+            self.low_cmd.motor_cmd[i].dq = VEL_STOP_F
+            self.low_cmd.motor_cmd[i].kp = 0.0
+            self.low_cmd.motor_cmd[i].kd = 0.0
+            self.low_cmd.motor_cmd[i].tau = 0.0
 
-        print("Robot connected successfully!")
-        self._print_state()
-        return True
+    def _lowstate_callback(self, msg):
+        with self.low_state_lock:
+            self.low_state = msg
 
-    def _print_state(self):
-        """Print the latest received robot state."""
-        print("\nCurrent joint angles (SDK order: FR, FL, RR, RL):")
-        for leg in ['FR', 'FL', 'RR', 'RL']:
-            hip = self.low_state.motorState[self.index[f'{leg}_0']].q
-            thigh = self.low_state.motorState[self.index[f'{leg}_1']].q
-            calf = self.low_state.motorState[self.index[f'{leg}_2']].q
-            print(f"  {leg}: hip={hip:+.3f}, thigh={thigh:+.3f}, calf={calf:+.3f}")
+    def _latest_state(self):
+        with self.low_state_lock:
+            return self.low_state
 
-        rpy = self.low_state.imu.rpy
-        print(f"IMU: roll={rpy[0]:+.3f}, pitch={rpy[1]:+.3f}, yaw={rpy[2]:+.3f}")
-    
-    def get_state(self):
-        """Get the current state (format conversion only, no UDP receive).
+    def release_motion_mode(self):
+        print("Releasing active Unitree motion mode before low-level control...")
 
-        Note: ensure `run()` has updated `self.low_state` before calling.
-        """
-        # Base angular velocity (SDK format)
-        base_ang_vel = np.array([
-            self.low_state.imu.gyroscope[0],
-            self.low_state.imu.gyroscope[1],
-            self.low_state.imu.gyroscope[2]
-        ], dtype=np.float32)
-        
-        # Projected gravity from IMU
-        rpy = np.array(self.low_state.imu.rpy, dtype=np.float32)
-        quat = R.from_euler('xyz', [rpy[0], rpy[1], rpy[2]]).as_quat()
-        projected_gravity = compute_projected_gravity(quat)
-        
-        # Joint positions and velocities (SDK -> training order)
-        q_sdk = np.array([self.low_state.motorState[i].q for i in range(12)], dtype=np.float32)
-        dq_sdk = np.array([self.low_state.motorState[i].dq for i in range(12)], dtype=np.float32)
-        
-        dof_pos = q_sdk[self.config.sdk_to_train_map]
-        dof_vel = dq_sdk[self.config.sdk_to_train_map]
-        
-        return base_ang_vel, projected_gravity, dof_pos, dof_vel
-    
-    def send_command(self, target_sdk, kp, kd):
-        """Send motor commands via SDK.
+        self.sport_client = SportClient()
+        self.sport_client.SetTimeout(5.0)
+        self.sport_client.Init()
 
-        Args:
-            target_sdk: target joint angles in SDK order (12-d array)
-            kp: proportional PD gain
-            kd: derivative PD gain
-        """
-        # Set motor commands
-        for i, jname in enumerate(self.joint_order):
-            self.low_cmd.motorCmd[self.index[jname]].q = float(target_sdk[i])
-            self.low_cmd.motorCmd[self.index[jname]].dq = 0.0
-            self.low_cmd.motorCmd[self.index[jname]].Kp = float(kp)
-            self.low_cmd.motorCmd[self.index[jname]].Kd = float(kd)
-            self.low_cmd.motorCmd[self.index[jname]].tau = 0.0
-        
+        self.motion_switcher = MotionSwitcherClient()
+        self.motion_switcher.SetTimeout(5.0)
+        self.motion_switcher.Init()
 
-    
-    def run(self, gamepad):
-        """Run the real-robot control loop."""
-        if not self.wait_for_connection():
-            print("Failed to connect to robot!")
+        for attempt in range(12):
+            status, result = self.motion_switcher.CheckMode()
+
+            mode_name = ""
+            if isinstance(result, dict):
+                mode_name = result.get("name", "")
+
+            print(
+                f"MotionSwitcher CheckMode attempt {attempt}: "
+                f"status={status}, result={result}"
+            )
+
+            if status == 0 and not mode_name:
+                print("No active high-level motion mode remains.")
+                time.sleep(0.5)
+                return
+
+            if mode_name:
+                print(
+                    f"Active mode '{mode_name}' detected. "
+                    "Calling StandDown() and ReleaseMode()."
+                )
+            else:
+                print(
+                    "Motion mode status not clean yet. "
+                    "Calling StandDown() and ReleaseMode() defensively."
+                )
+
+            try:
+                self.sport_client.StandDown()
+            except Exception as exc:
+                print(f"Warning: SportClient.StandDown() failed: {exc}")
+
+            time.sleep(0.2)
+
+            try:
+                self.motion_switcher.ReleaseMode()
+            except Exception as exc:
+                print(f"Warning: MotionSwitcher.ReleaseMode() failed: {exc}")
+
+            time.sleep(1.0)
+
+        status, result = self.motion_switcher.CheckMode()
+        raise RuntimeError(
+            "Could not release active Unitree motion mode after 12 attempts. "
+            f"Last status={status}, result={result}"
+        )
+
+    def wait_for_connection(self, timeout_s=5.0):
+        print("Waiting for Go2 low-state over SDK2/DDS...")
+
+        t0 = time.time()
+        while time.time() - t0 < timeout_s:
+            st = self._latest_state()
+            if st is not None:
+                q_sum = sum(abs(st.motor_state[i].q) for i in range(12))
+                if q_sum > 0.01:
+                    print("Robot low-state received.")
+                    self.print_state()
+                    return True
+            time.sleep(0.01)
+
+        print("ERROR: no valid Go2 LowState received.")
+        print(f"Check robot mode, Ethernet address, and --network={self.network}")
+        return False
+
+    def print_state(self):
+        st = self._latest_state()
+        if st is None:
+            print("No state yet.")
             return
 
+        print("\nCurrent joint angles, SDK order:")
+        for leg in ["FR", "FL", "RR", "RL"]:
+            hip = st.motor_state[self.index[f"{leg}_0"]].q
+            thigh = st.motor_state[self.index[f"{leg}_1"]].q
+            calf = st.motor_state[self.index[f"{leg}_2"]].q
+            print(
+                f"  {leg}: "
+                f"hip={hip:+.3f}, thigh={thigh:+.3f}, calf={calf:+.3f}"
+            )
+
+        rpy = st.imu_state.rpy
+        print(
+            f"IMU: roll={rpy[0]:+.3f}, "
+            f"pitch={rpy[1]:+.3f}, yaw={rpy[2]:+.3f}"
+        )
+
+    def get_state(self):
+        st = self._latest_state()
+        if st is None:
+            raise RuntimeError("No low_state received yet")
+
+        base_ang_vel = np.array(st.imu_state.gyroscope, dtype=np.float32)
+
+        rpy = np.array(st.imu_state.rpy, dtype=np.float32)
+        quat = quat_from_euler_xyz(rpy[0], rpy[1], rpy[2])
+        projected_gravity = compute_projected_gravity(quat)
+
+        q_sdk = np.array([st.motor_state[i].q for i in range(12)], dtype=np.float32)
+        dq_sdk = np.array([st.motor_state[i].dq for i in range(12)], dtype=np.float32)
+
+        dof_pos = q_sdk[self.config.sdk_to_train_map]
+        dof_vel = dq_sdk[self.config.sdk_to_train_map]
+
+        return base_ang_vel, projected_gravity, dof_pos, dof_vel
+
+    def write_sdk_targets(self, target_sdk, kp, kd):
+        target_sdk = np.clip(
+            target_sdk,
+            self.config.joint_limit_low_sdk,
+            self.config.joint_limit_high_sdk,
+        )
+
+        for i, jname in enumerate(self.joint_order):
+            mid = self.index[jname]
+            self.low_cmd.motor_cmd[mid].mode = 0x01
+            self.low_cmd.motor_cmd[mid].q = float(target_sdk[i])
+            self.low_cmd.motor_cmd[mid].dq = 0.0
+            self.low_cmd.motor_cmd[mid].kp = float(kp)
+            self.low_cmd.motor_cmd[mid].kd = float(kd)
+            self.low_cmd.motor_cmd[mid].tau = 0.0
+
+        self.low_cmd.crc = self.crc.Crc(self.low_cmd)
+        self.lowcmd_pub.Write(self.low_cmd)
+
+    def send_command_train_order(self, target_train, kp, kd):
+        target_sdk = target_train[self.config.train_to_sdk_map]
+        self.write_sdk_targets(target_sdk, kp, kd)
+
+    def send_damping(self, kd=6.0, n=100):
+        for _ in range(n):
+            for i in range(12):
+                self.low_cmd.motor_cmd[i].mode = 0x01
+                self.low_cmd.motor_cmd[i].q = 0.0
+                self.low_cmd.motor_cmd[i].dq = 0.0
+                self.low_cmd.motor_cmd[i].kp = 0.0
+                self.low_cmd.motor_cmd[i].kd = float(kd)
+                self.low_cmd.motor_cmd[i].tau = 0.0
+
+            self.low_cmd.crc = self.crc.Crc(self.low_cmd)
+            self.lowcmd_pub.Write(self.low_cmd)
+            time.sleep(self.config.sim_dt)
+
+    def run(self, gamepad):
+        if not self.wait_for_connection():
+            return
+
+        print("\nStarting RX-00 policy on Go2 via SDK2/DDS joystick control.")
+        print("Start button exits and sends damping.\n")
+
         motiontime = 0
-        
-        while True:
-            loop_start = time.time()  # record loop start time
-            motiontime += 1
-            sim_time = motiontime * self.config.sim_dt
-            
-            # ⚠️ First receive low_state
-            self.udp.Recv()
-            self.udp.GetRecv(self.low_state)
+        next_print_t = 0.0
 
-            if gamepad.exit_requested:
-                damping_cmd = np.zeros(12, dtype=np.float32)
-                self.send_command(damping_cmd, 0.0, 3.0)
-                self.udp.SetSend(self.low_cmd)
-                self.udp.Send()
-                break
+        try:
+            while True:
+                loop_start = time.time()
+                motiontime += 1
+                sim_time = motiontime * self.config.sim_dt
 
-            base_ang_vel, projected_gravity, dof_pos, dof_vel = self.get_state()
-            rpy = np.array(self.low_state.imu.rpy, dtype=np.float32)
-            
-            # Phase 1: stand up
-            if sim_time <= self.config.standup_duration:
-                rate = min(sim_time / self.config.standup_duration, 1.0)
-                self.qDes_train = dof_pos * (1 - rate) + self.config.default_dof_pos * rate
-                
-                # Update cached command (SDK order)
-                self.current_qDes_sdk = self.qDes_train[self.config.train_to_sdk_map]
-                self.current_kp = self.config.kp_stand
-                self.current_kd = self.config.kd_stand
-            
-            # Phase 2: Stabilize
-            elif sim_time <= self.config.standup_duration + self.config.stabilize_duration:
-                self.qDes_train = self.config.default_dof_pos.copy()
-                
-                # Update cached command (SDK order)
-                self.current_qDes_sdk = self.qDes_train[self.config.train_to_sdk_map]
-                self.current_kp = self.config.kp_walk
-                self.current_kd = self.config.kd_walk
-            
-            # Phase 3: Policy control
-            else:
-                # Check tilt
+                if gamepad.exit_requested:
+                    print("\nExit requested; sending damping.")
+                    self.send_damping(kd=6.0, n=200)
+                    break
+
+                base_ang_vel, projected_gravity, dof_pos, dof_vel = self.get_state()
+
+                st = self._latest_state()
+                rpy = np.array(st.imu_state.rpy, dtype=np.float32)
+
                 if abs(rpy[0]) > 0.8 or abs(rpy[1]) > 0.8:
-                    print("\n⚠️  WARNING: Robot tilted!")
-                    print(f"roll={rpy[0]:.2f}, pitch={rpy[1]:.2f}")
-                
-                # Policy inference (33Hz: executed every 6 sim_dt)
-                self.policy_counter += 1
-                if self.policy_counter >= self.policy_decimation:
-                    self.policy_counter = 0
-                    
-                    # Get commands from gamepad
-                    cmd_vx, cmd_vy, cmd_vyaw = gamepad.get_velocity()
-                    commands = np.array([cmd_vx, cmd_vy, cmd_vyaw], dtype=np.float32)
-                    
-                    # Get state
-                    base_ang_vel, projected_gravity, dof_pos, dof_vel = self.get_state()
-                    
-                    # Build observation
-                    obs = build_obs(base_ang_vel, projected_gravity, commands,
-                                    dof_pos, dof_vel, self.last_action, self.config)
-                    obs_batch = obs[np.newaxis, :].astype(np.float32)
-                    # Policy inference
-                    with torch.no_grad():
-                        obs_tensor = torch.from_numpy(obs_batch)
-                        action_tensor = self.policy(obs_tensor)
-                        if isinstance(action_tensor, tuple):
-                            action_tensor = action_tensor[0]
-                        action = action_tensor.cpu().numpy().flatten().astype(np.float32)
-                    
-                    # Scale action
-                    self.last_action, self.qDes_train = action_to_joint_target(
-                        action,
-                        self.config,
-                        self.action_filter,
+                    print(
+                        f"\nWARNING: robot tilted; "
+                        f"roll={rpy[0]:.2f}, pitch={rpy[1]:.2f}"
                     )
-                    
-                    # Update cached command (this will be sent repeatedly for the next frames)
+                    self.send_damping(kd=6.0, n=200)
+                    break
+
+                if sim_time <= self.config.standup_duration:
+                    rate = min(sim_time / self.config.standup_duration, 1.0)
+                    self.qDes_train = (
+                        dof_pos * (1.0 - rate)
+                        + self.config.default_dof_pos * rate
+                    )
+                    self.current_qDes_sdk = self.qDes_train[self.config.train_to_sdk_map]
+                    self.current_kp = self.config.kp_stand
+                    self.current_kd = self.config.kd_stand
+
+                elif sim_time <= (
+                    self.config.standup_duration + self.config.stabilize_duration
+                ):
+                    self.qDes_train = self.config.default_dof_pos.copy()
                     self.current_qDes_sdk = self.qDes_train[self.config.train_to_sdk_map]
                     self.current_kp = self.config.kp_walk
                     self.current_kd = self.config.kd_walk
-                    
-        
-            # Key fix: send commands every 200Hz loop regardless of inference
-            if self.current_qDes_sdk is not None:
-                self.send_command(self.current_qDes_sdk, self.current_kp, self.current_kd)
-            else:
-                # Initialization phase: send damping command to avoid sudden motor motion
-                damping_cmd = np.zeros(12, dtype=np.float32)
-                self.send_command(damping_cmd, 0.0, 3.0)
 
-            # send commands (keeps UDP communication alive at 200Hz)
-            self.udp.SetSend(self.low_cmd)
-            self.udp.Send()
+                else:
+                    self.policy_counter += 1
 
-            # Precise timing: compensate for execution time
-            elapsed = time.time() - loop_start
-            sleep_time = max(0, self.config.sim_dt - elapsed)
-            if sleep_time > 0:
-                time.sleep(sleep_time)
-    
-    def _control_step(self, sim_time, motiontime, gamepad):
-        """Single control step (called at 200Hz)."""
-        # Convert the previously received low_state into observation format
-        
-        rpy = np.array(self.low_state.imu.rpy, dtype=np.float32)
-        
-        
+                    if self.policy_counter >= self.policy_decimation:
+                        self.policy_counter = 0
 
-# ========== Main ==========
+                        cmd_vx, cmd_vy, cmd_vyaw = gamepad.get_velocity()
+                        commands = np.array(
+                            [cmd_vx, cmd_vy, cmd_vyaw],
+                            dtype=np.float32,
+                        )
 
-if __name__ == '__main__':
+                        obs = build_obs(
+                            base_ang_vel,
+                            projected_gravity,
+                            commands,
+                            dof_pos,
+                            dof_vel,
+                            self.last_action,
+                            self.config,
+                        )
+                        obs = normalize_obs(
+                            obs,
+                            getattr(self.config, "clip_observations", None),
+                        )
+                        obs_batch = obs[np.newaxis, :].astype(np.float32)
+
+                        with torch.no_grad():
+                            obs_tensor = torch.from_numpy(obs_batch)
+                            action_tensor = self.policy(obs_tensor)
+                            if isinstance(action_tensor, tuple):
+                                action_tensor = action_tensor[0]
+                            action = (
+                                action_tensor.cpu()
+                                .numpy()
+                                .flatten()
+                                .astype(np.float32)
+                            )
+
+                        self.last_action, self.qDes_train = action_to_joint_target(
+                            action,
+                            self.config,
+                            self.action_filter,
+                        )
+
+                        self.current_qDes_sdk = (
+                            self.qDes_train[self.config.train_to_sdk_map]
+                        )
+                        self.current_kp = self.config.kp_walk
+                        self.current_kd = self.config.kd_walk
+
+                if self.current_qDes_sdk is not None:
+                    self.write_sdk_targets(
+                        self.current_qDes_sdk,
+                        self.current_kp,
+                        self.current_kd,
+                    )
+                else:
+                    self.send_damping(kd=3.0, n=1)
+
+                if sim_time >= next_print_t:
+                    vx, vy, vyaw = gamepad.get_velocity()
+                    print(
+                        f"t={sim_time:6.2f}s | "
+                        f"cmd=({vx:+.2f}, {vy:+.2f}, {vyaw:+.2f}) | "
+                        f"rpy=({rpy[0]:+.2f}, {rpy[1]:+.2f}, {rpy[2]:+.2f})"
+                    )
+                    next_print_t += 1.0
+
+                elapsed = time.time() - loop_start
+                sleep_time = max(0.0, self.config.sim_dt - elapsed)
+                if sleep_time > 0:
+                    time.sleep(sleep_time)
+
+        finally:
+            self.send_damping(kd=6.0, n=100)
+
+
+# =============================================================================
+# Main
+# =============================================================================
+
+def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--mode', type=str, default='sim')
-    parser.add_argument('--model', type=str, default='policy_45_continus.pt')
-    parser.add_argument('--config', type=str, default='config/go1.yaml')
+    parser.add_argument("--mode", type=str, default="real", choices=["real", "sim"])
+    parser.add_argument("--config", type=str, default="config/go2.yaml")
+    parser.add_argument("--model", type=str, default=None)
+    parser.add_argument("--network", type=str, default="enp130s0")
     args = parser.parse_args()
-    
-    # Adjust config path if it doesn't exist
-    if not os.path.exists(args.config):
-        args.config = os.path.join('config', args.config)
-    
-    # 1. 加载 Config (路径已经在内部处理好了)
-    config = load_config(args.config)
-    
-    # 2. 初始化 Gamepad (使用 config 中的 range)
+
+    if args.mode != "real":
+        raise RuntimeError(
+            "This replacement script is SDK2 real-robot only. "
+            "Use the original repo file for --mode sim."
+        )
+
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+
+    config_path = args.config
+    if not os.path.isabs(config_path):
+        config_path = os.path.join(script_dir, config_path)
+
+    config = load_config(config_path)
+    policy_path = resolve_policy_path(config, args.model)
+
     gamepad = GamepadController(
         vx_range=config.vx_range,
         vy_range=config.vy_range,
-        vyaw_range=config.vyaw_range
+        vyaw_range=config.vyaw_range,
     )
+
+    print("\n" + "=" * 70)
+    print(" Gamepad Control: Go2 SDK2 Real Deployment")
+    print("=" * 70)
+    print(" Left joystick:")
+    print("   Up/Down      vx")
+    print("   Left/Right   vy")
+    print(" Right joystick:")
+    print("   Left/Right   yaw")
+    print(" D-pad:")
+    print("   Up/Down      incremental vx")
+    print(" Start:")
+    print("   exit and send damping")
+    print("=" * 70 + "\n")
+
     gamepad.start()
-    
-    print("\n" + "="*70)
-    print("🎮 Gamepad Control (Logitech F710)")
-    print("="*70)
-    print("  Left Joystick:")
-    print("    - Up/Down: Forward/Backward speed (vx)")
-    print("    - Left/Right: Strafe speed (vy)")
-    print("  Right Joystick:")
-    print("    - Left/Right: Turn speed (vyaw)")
-    print("  Start Button: Exit program")
-    print("  Note: Release joystick to stop immediately")
-    print("="*70 + "\n")
-    
-    # Create controller based on mode
-    if args.mode == 'sim':
-        # 3. 直接传入 config 和模型名称
-        controller = Sim2SimController(config, args.model)
+
+    try:
+        controller = Go2SDK2JoystickController(
+            config=config,
+            policy_path=policy_path,
+            network=args.network,
+        )
         controller.run(gamepad)
-    else:
-        # Sim2Real 同样逻辑
-        policy_full_path = os.path.join(config.policy_path, args.model)
-        controller = Sim2RealController(config, policy_full_path)
-        controller.run(gamepad)
-    
-    # Stop gamepad controller
-    gamepad.stop()
-    print("\nProgram ended.")
+    finally:
+        gamepad.stop()
+        print("\nProgram ended.")
+
+
+if __name__ == "__main__":
+    main()
