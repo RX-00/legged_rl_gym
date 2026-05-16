@@ -269,7 +269,7 @@ The current Go2 AMP command config uses:
 heading_command = False
 smooth_command_changes = True
 smooth_command_alpha = 0.99
-lin_vel_x = [-1.0, 2.2]
+lin_vel_x = [0.0, 0.5]
 lin_vel_y = [-0.3, 0.3]
 ang_vel_yaw = [-1.57, 1.57]
 ```
