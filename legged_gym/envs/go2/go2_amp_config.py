@@ -146,7 +146,7 @@ class GO2AMPCfg( LeggedRobotCfg ):
                                        # Higher alpha means smoother, recommended 0.9-0.99
         
         class ranges:
-            lin_vel_x = [-1.0, 2.2] # min max [m/s] - backward training may be insufficient due to asymmetric range
+            lin_vel_x = [0.0, 0.5] # min max [m/s] - forward-only training range
             lin_vel_y = [-0.3, 0.3]   # min max [m/s]
             ang_vel_yaw = [-1.57, 1.57]    # min max [rad/s]
             heading = [-3.14, 3.14]
